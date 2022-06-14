@@ -1,0 +1,14 @@
+ftfy
+timm
+transformers==4.2.1
+sentencepiece
+h5py
+wandb
+tqdm
+numpy
+pandas
+matplotlib
+pyyaml
+sacrebleu
+git+git://github.com/j-min/language-evaluation@master
+wget
