@@ -66,7 +66,7 @@ done
 ## Run VL Experiments
 
 ### Installation
-The environment conflicts with that used for GLUE experiments on transformers version. The other packages should be fine. The easiest way to avoid issues is to create a stand-alone environment.
+The environment for VL experiments conflicts with that used for GLUE experiments on transformers package (version 4.2 vs. 4.6). The other packages should be fine, so you can install all packages and overwrite the transformers on the environment you used before by the following commands. However, the easiest way to avoid issues is to create a stand-alone environment.
 
 ```bash
 # Create python environment (optional)
@@ -91,7 +91,7 @@ pip install torch==1.10.2+cu111 torchvision==0.11.3+cu111 -f https://download.py
 
 ### Data Preparation
 
-Follow [VL_adapter's README](https://github.com/ylsung/VL_adapter) to download data from the [link](https://drive.google.com/file/d/1O_RU1iFh_sbItZCTkOHUrbVIQQ_89Djj/view), and put the data under `./Ladder-Side-Tuning`.
+Follow [VL_adapter's README](https://github.com/ylsung/VL_adapter) to download data from the [link](https://drive.google.com/file/d/1O_RU1iFh_sbItZCTkOHUrbVIQQ_89Djj/view), and put the data folder `datasets` under `./Ladder-Side-Tuning`.
 
 ### Commands
 ```bash
