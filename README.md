@@ -1,5 +1,14 @@
 # Ladder Side-Tuning (LST)
 
+* Authors: [Yi-Lin Sung](https://ylsung.github.io/), [Jaemin Cho](https://j-min.io/), [Mohit Bansal](https://www.cs.unc.edu/~mbansal/)
+* Paper: ["LST: Ladder Side-Tuning for Parameter and Memory Efficient Transfer Learning"](https://arxiv.org/abs/2206.06522)
+
+We propose Ladder Side-Tuning (LST), a new parameter-efficient transfer learning (PETL) technique that reduces training memory requirements by more substantial amounts. Unlike existing PETL methods that insert additional parameters inside backbone networks, we train a ladder side network, a small and separate network that takes intermediate activations as input via shortcut connections (ladders) from backbone networks and makes predictions.
+
+On both GLUE and VL tasks, LST saves 2.7x more memory than other PETL methods. To further show the advantage of this better memory efficiency, we also apply LST to larger T5 models (T5-large, T5-3B), attaining better GLUE performance than full fine-tuning and other PETL methods. 
+
+![](assets/teaser.png)
+
 ## Run GLUE Experiments
 
 ### Installation
@@ -107,4 +116,18 @@ bash [Script.sh] [GPU ID] [Number of GPU you want to use]
 
 ## Acknowledgement
 
-This repo borrows codes from [Compacter](https://github.com/rabeehk/compacter), [CLIP-ViL](https://github.com/clip-vil/CLIP-ViL) and [VL-Adapter](https://github.com/ylsung/VL_adapter).
+This repo borrows codes from [Compacter](https://github.com/rabeehk/compacter), [CLIP-ViL](https://github.com/clip-vil/CLIP-ViL), [VL-Adapter](https://github.com/ylsung/VL_adapter), and [Torch-Pruning](https://github.com/VainF/Torch-Pruning).
+
+
+## Reference
+
+Please consider to cite our paper if use this repo in your work.
+
+```bibtex
+@inproceedings{Sung2022LST,
+  title     = {LST: Ladder Side-Tuning for Parameter and Memory Efficient Transfer Learning},
+  author    = {Yi-Lin Sung, Jaemin Cho, Mohit Bansal},
+  booktitle = {arXiv},
+  year      = {2022}
+}
+```
