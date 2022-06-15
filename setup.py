@@ -1,4 +1,4 @@
-"""Install Compacter."""
+"""Install Ladder Side-Tuning."""
 import os 
 import setuptools
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -10,10 +10,10 @@ def setup_package():
   setuptools.setup(
       name='seq2seq',
       version='0.0.1',
-      description='Compacter',
+      description='Ladder Side-Tuning',
       long_description=long_description,
       long_description_content_type='text/markdown',
-      author='Rabeeh Karimi Mahabadi',
+      author='Yi-Lin Sung',
       license='MIT License',
       packages=setuptools.find_packages(
           exclude=['docs', 'tests', 'scripts', 'examples']),
