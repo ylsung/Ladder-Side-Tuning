@@ -768,6 +768,13 @@ class VLT5(T5ForConditionalGeneration):
         hidden_states = encoder_outputs[0]
         side_hidden_states = encoder_outputs.last_side_hidden_state
 
+        print(hidden_states.sum())
+
+        if side_hidden_states is None:
+            print(None)
+        else:
+            print(side_hidden_states.sum())
+
         if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
             # get decoder inputs from shifting lm labels to the right
             decoder_input_ids = self._shift_right(labels)
@@ -1114,9 +1121,10 @@ if __name__ == "__main__":
 
     if config.use_side_transformers:
         config.side_config = SideConfig()
-        config.side_config.task_reduction_factor = 8
+        config.side_config.task_reduction_factor = 1
         config.side_config.decoder_side_layers = None
         config.side_config.encoder_side_layers = None
+        config.side_config.use_gate = "one"
     else:
         config.side_config = None
 
@@ -1135,19 +1143,70 @@ if __name__ == "__main__":
     config.default_obj_order_ids = tokenizer.convert_tokens_to_ids([f'<vis_extra_id_{i}>' for i in range(100)])
 
     model = VLT5.from_pretrained("t5-base", config=config)
+    # model = T5ForConditionalGeneration.from_pretrained("t5-base", config=config)
     model.resize_token_embeddings(tokenizer.vocab_size)
     model.tokenizer = tokenizer
 
+    def initialize_side_network(model):
+        pruned_state_dict = model.state_dict()
+        self_model_state_dict = model.state_dict()
+        for n, p in model.named_parameters():
+            if "relative_attention_bias" in n:
+                # only in the first layer of the pre-trained model
+                infer_n = n.split(".")
+                infer_n[1] = "block"
+                infer_n[2] = "0"
+                infer_n = ".".join(infer_n)
+
+                print(n, infer_n)
+                # the size is wrong in pre-trained weights, so load from self model
+                state = self_model_state_dict[infer_n]
+                p.data.copy_(state)
+
+            elif "side_block" in n:
+                infer_n = n.split(".")
+                infer_n[1] = "block"
+                infer_n = ".".join(infer_n)
+
+                print(n, infer_n)
+    
+                state = pruned_state_dict[infer_n]
+
+                p.data.copy_(state)
+
+            if "final_side_layer_norm" in n:
+                infer_n = n.split("_")
+                infer_n.pop(1)
+                infer_n = "_".join(infer_n)
+
+                print(n, infer_n)
+
+                state = pruned_state_dict[infer_n]
+
+                p.data.copy_(state)
+
+    initialize_side_network(model)
+
     inputs = tokenizer(["Hello, my dog is cute and ", "K dfa deaf"], return_tensors="pt", padding=True)
     
+    torch.manual_seed(1)
+
     vis_feats = torch.randn(2, 36, 2048)
     vis_pos = torch.randn(2, 36, 4)
 
+    print(vis_feats.sum(), vis_pos.sum())
+
+    model.eval()
+
     generation_output = model.generate(
-                **inputs,
-                vis_inputs=(vis_feats, vis_pos),
-                task="gqa"
+        **inputs,
+        vis_inputs=(vis_feats, vis_pos),
+        task="gqa"
     )
+
+    # generation_output = model.generate(
+    #     **inputs,
+    # )
     
     print(generation_output)
 

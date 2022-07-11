@@ -1210,6 +1210,8 @@ class T5Stack(T5PreTrainedModel):
                         else:
                             side_hidden_states = side_hidden_states + side_downsample(layer_outputs[0])
 
+                    print(side_hidden_states.sum())
+
                     if use_cache is False:
                         side_layer_outputs = side_layer_outputs[:1] + (None,) + side_layer_outputs[1:]
 
@@ -1229,6 +1231,8 @@ class T5Stack(T5PreTrainedModel):
             # layer_outputs is a tuple with:
             # hidden-states, key-value-states, (self-attention weights), (self-attention position bias), (cross-attention weights), (cross-attention position bias)
             hidden_states, present_key_value_state = layer_outputs[:2]
+
+            print(hidden_states.sum())
 
             # We share the position biases between the layers - the first layer store them
             # layer_outputs = hidden-states, key-value-states (self-attention weights),
@@ -1854,9 +1858,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             "encoder_outputs": encoder_outputs,
             "attention_mask": attention_mask,
             "use_cache": use_cache,
-            "task": kwargs["task"]
             #"lang": kwargs["lang"]
         }
+
+        if "task" in kwargs:
+            returns["task"] = kwargs["task"]
 
         if "side_past_key_values" in kwargs:
             returns["side_past_key_values"] = kwargs["side_past_key_values"]
