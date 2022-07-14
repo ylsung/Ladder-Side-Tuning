@@ -321,6 +321,7 @@ class JointEncoder(T5Stack):
         hidden_states = self.dropout(backbone_embeds)
 
         side_hidden_states = self.side_first_downsample(self.dropout(inputs_embeds)) if self.use_side_transformers else None
+
         side_present_key_value_state = None
 
         if self.config.num_layers > 0:
@@ -768,13 +769,6 @@ class VLT5(T5ForConditionalGeneration):
         hidden_states = encoder_outputs[0]
         side_hidden_states = encoder_outputs.last_side_hidden_state
 
-        print(hidden_states.sum())
-
-        if side_hidden_states is None:
-            print(None)
-        else:
-            print(side_hidden_states.sum())
-
         if labels is not None and decoder_input_ids is None and decoder_inputs_embeds is None:
             # get decoder inputs from shifting lm labels to the right
             decoder_input_ids = self._shift_right(labels)
@@ -1098,7 +1092,7 @@ if __name__ == "__main__":
     config.use_adapter = False
     config.use_compacter = False
     config.use_lradapter = False
-    config.use_side_transformers = False
+    config.use_side_transformers = True
 
     if config.use_hyperformer or config.use_adapter or config.use_compacter:
 
@@ -1141,8 +1135,14 @@ if __name__ == "__main__":
     num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 
     config.default_obj_order_ids = tokenizer.convert_tokens_to_ids([f'<vis_extra_id_{i}>' for i in range(100)])
+    
+    torch.manual_seed(1)
 
     model = VLT5.from_pretrained("t5-base", config=config)
+
+    # torch.save(model.state_dict(), "test.ckpt")
+
+    model.load_state_dict(torch.load("test.ckpt"), strict=False)
     # model = T5ForConditionalGeneration.from_pretrained("t5-base", config=config)
     model.resize_token_embeddings(tokenizer.vocab_size)
     model.tokenizer = tokenizer
@@ -1201,7 +1201,8 @@ if __name__ == "__main__":
     generation_output = model.generate(
         **inputs,
         vis_inputs=(vis_feats, vis_pos),
-        task="gqa"
+        task="gqa",
+        num_beams=5,
     )
 
     # generation_output = model.generate(
@@ -1211,7 +1212,6 @@ if __name__ == "__main__":
     print(generation_output)
 
     print(tokenizer.batch_decode(generation_output, skip_special_tokens=True))
-
 
     orig_param_size = 222903552
 
