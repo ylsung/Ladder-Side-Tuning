@@ -321,6 +321,7 @@ class JointEncoder(T5Stack):
         hidden_states = self.dropout(backbone_embeds)
 
         side_hidden_states = self.side_first_downsample(self.dropout(inputs_embeds)) if self.use_side_transformers else None
+
         side_present_key_value_state = None
 
         if self.config.num_layers > 0:
@@ -1091,7 +1092,7 @@ if __name__ == "__main__":
     config.use_adapter = False
     config.use_compacter = False
     config.use_lradapter = False
-    config.use_side_transformers = False
+    config.use_side_transformers = True
 
     if config.use_hyperformer or config.use_adapter or config.use_compacter:
 
@@ -1114,9 +1115,10 @@ if __name__ == "__main__":
 
     if config.use_side_transformers:
         config.side_config = SideConfig()
-        config.side_config.task_reduction_factor = 8
+        config.side_config.task_reduction_factor = 1
         config.side_config.decoder_side_layers = None
         config.side_config.encoder_side_layers = None
+        config.side_config.use_gate = "one"
     else:
         config.side_config = None
 
@@ -1133,26 +1135,83 @@ if __name__ == "__main__":
     num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 
     config.default_obj_order_ids = tokenizer.convert_tokens_to_ids([f'<vis_extra_id_{i}>' for i in range(100)])
+    
+    torch.manual_seed(1)
 
     model = VLT5.from_pretrained("t5-base", config=config)
+
+    # torch.save(model.state_dict(), "test.ckpt")
+
+    model.load_state_dict(torch.load("test.ckpt"), strict=False)
+    # model = T5ForConditionalGeneration.from_pretrained("t5-base", config=config)
     model.resize_token_embeddings(tokenizer.vocab_size)
     model.tokenizer = tokenizer
 
+    def initialize_side_network(model):
+        pruned_state_dict = model.state_dict()
+        self_model_state_dict = model.state_dict()
+        for n, p in model.named_parameters():
+            if "relative_attention_bias" in n:
+                # only in the first layer of the pre-trained model
+                infer_n = n.split(".")
+                infer_n[1] = "block"
+                infer_n[2] = "0"
+                infer_n = ".".join(infer_n)
+
+                print(n, infer_n)
+                # the size is wrong in pre-trained weights, so load from self model
+                state = self_model_state_dict[infer_n]
+                p.data.copy_(state)
+
+            elif "side_block" in n:
+                infer_n = n.split(".")
+                infer_n[1] = "block"
+                infer_n = ".".join(infer_n)
+
+                print(n, infer_n)
+    
+                state = pruned_state_dict[infer_n]
+
+                p.data.copy_(state)
+
+            if "final_side_layer_norm" in n:
+                infer_n = n.split("_")
+                infer_n.pop(1)
+                infer_n = "_".join(infer_n)
+
+                print(n, infer_n)
+
+                state = pruned_state_dict[infer_n]
+
+                p.data.copy_(state)
+
+    initialize_side_network(model)
+
     inputs = tokenizer(["Hello, my dog is cute and ", "K dfa deaf"], return_tensors="pt", padding=True)
     
+    torch.manual_seed(1)
+
     vis_feats = torch.randn(2, 36, 2048)
     vis_pos = torch.randn(2, 36, 4)
 
+    print(vis_feats.sum(), vis_pos.sum())
+
+    model.eval()
+
     generation_output = model.generate(
-                **inputs,
-                vis_inputs=(vis_feats, vis_pos),
-                task="gqa"
+        **inputs,
+        vis_inputs=(vis_feats, vis_pos),
+        task="gqa",
+        num_beams=5,
     )
+
+    # generation_output = model.generate(
+    #     **inputs,
+    # )
     
     print(generation_output)
 
     print(tokenizer.batch_decode(generation_output, skip_special_tokens=True))
-
 
     orig_param_size = 222903552
 
