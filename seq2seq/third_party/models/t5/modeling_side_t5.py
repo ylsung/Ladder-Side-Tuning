@@ -42,13 +42,15 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel, find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import logging
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
-from .configuration_t5 import T5Config
-from .modeling_side_outputs import SideBaseModelOutputWithPastAndCrossAttentions, SideSeq2SeqLMOutput, SideBaseModelOutput
+from seq2seq.third_party.models.t5.configuration_t5 import T5Config
+from seq2seq.third_party.models.t5.modeling_side_outputs import SideBaseModelOutputWithPastAndCrossAttentions, SideSeq2SeqLMOutput, SideBaseModelOutput
 
 from seq2seq.adapters import AdapterController
 from seq2seq.hypercomplex.layers import  PHMLinear
 from seq2seq.hypercomplex.inits import  glorot_uniform, glorot_normal
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
+
+from seq2seq.third_party.generation_utils import GenerationMixin as SideGenerationMixin
 
 
 logger = logging.get_logger(__name__)
@@ -867,9 +869,11 @@ class T5Stack(T5PreTrainedModel):
             # add every layer
             side_layers = list(range(config.num_layers))
 
+        self.first_available_layer = side_layers[0] # the first layer has not-None module, will be used to let it has relative attention bias
+
         self.side_block = nn.ModuleList(
             [T5Block(self.per_layer_config(side_config, i, self.adapter_config, self.is_decoder),
-                     has_relative_attention_bias=bool(i == 0),
+                     has_relative_attention_bias=bool(i == self.first_available_layer),
                      adapter_config=adapter_config) 
                      if i in side_layers else None
                      for i in range(config.num_layers)]
@@ -877,7 +881,11 @@ class T5Stack(T5PreTrainedModel):
 
         self.add_residual_after = config.add_residual_after
         
-        self.side_first_downsample = nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling)
+        if adapter_config.task_reduction_factor == 1:
+            # for the debug use
+            self.side_first_downsample = nn.Identity()
+        else:
+            self.side_first_downsample = nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling)
 
         if config.side_downsample_pool:
             self.side_downsamples = nn.ModuleList(
@@ -886,11 +894,19 @@ class T5Stack(T5PreTrainedModel):
                 for i in range(config.num_layers)]
             )
         else:
-            self.side_downsamples = nn.ModuleList(
-                [nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling) 
-                if i in side_layers else None
-                for i in range(config.num_layers)]
-            )
+            if adapter_config.task_reduction_factor == 1:
+                # for the debug use
+                self.side_downsamples = nn.ModuleList(
+                    [nn.Identity()
+                    if i in side_layers else None
+                    for i in range(config.num_layers)]
+                )
+            else:
+                self.side_downsamples = nn.ModuleList(
+                    [nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling) 
+                    if i in side_layers else None
+                    for i in range(config.num_layers)]
+                )
 
         self.use_gate = config.use_gate
         if self.use_gate == "learnable":
@@ -1101,6 +1117,10 @@ class T5Stack(T5PreTrainedModel):
 
         position_bias = None
         encoder_decoder_position_bias = None
+
+        side_position_bias = None
+        side_encoder_decoder_position_bias = None
+
         backbone_hidden_state = None
         side_past_key_value = None
 
@@ -1130,6 +1150,8 @@ class T5Stack(T5PreTrainedModel):
                     backbone_hidden_state = backbone_hidden_state.to(hidden_states.device)
                 if position_bias is not None:
                     position_bias = position_bias.to(hidden_states.device)
+                if side_position_bias is not None:
+                    side_position_bias = side_position_bias.to(hidden_states.device)
                 if encoder_hidden_states is not None:
                     encoder_hidden_states = encoder_hidden_states.to(hidden_states.device)
                 if side_encoder_hidden_states is not None:
@@ -1138,6 +1160,8 @@ class T5Stack(T5PreTrainedModel):
                     encoder_extended_attention_mask = encoder_extended_attention_mask.to(hidden_states.device)
                 if encoder_decoder_position_bias is not None:
                     encoder_decoder_position_bias = encoder_decoder_position_bias.to(hidden_states.device)
+                if side_encoder_decoder_position_bias is not None:
+                    side_encoder_decoder_position_bias = side_encoder_decoder_position_bias.to(hidden_states.device)
                 if layer_head_mask is not None:
                     layer_head_mask = layer_head_mask.to(hidden_states.device)
                 if cross_attn_layer_head_mask is not None:
@@ -1224,10 +1248,10 @@ class T5Stack(T5PreTrainedModel):
                     side_layer_outputs = side_layer_module(
                         side_hidden_states,
                         attention_mask=extended_attention_mask,
-                        position_bias=position_bias,
+                        position_bias=side_position_bias,
                         encoder_hidden_states=side_encoder_hidden_states,
                         encoder_attention_mask=encoder_extended_attention_mask,
-                        encoder_decoder_position_bias=encoder_decoder_position_bias,
+                        encoder_decoder_position_bias=side_encoder_decoder_position_bias,
                         layer_head_mask=layer_head_mask,
                         cross_attn_layer_head_mask=cross_attn_layer_head_mask,
                         past_key_value=side_past_key_value,
@@ -1249,6 +1273,10 @@ class T5Stack(T5PreTrainedModel):
 
                     if use_cache is False:
                         side_layer_outputs = side_layer_outputs[:1] + (None,) + side_layer_outputs[1:]
+
+                    side_position_bias = side_layer_outputs[2]
+                    if self.is_decoder and side_encoder_hidden_states is not None:
+                        encoder_decoder_position_bias = side_layer_outputs[4 if output_attentions else 3]
 
                     if output_attentions:
                         all_side_attentions = all_side_attentions + (side_layer_outputs[3],)
@@ -1660,7 +1688,7 @@ class T5Model(T5PreTrainedModel):
 
 
 @add_start_docstrings("""T5 Model with a `language modeling` head on top. """, T5_START_DOCSTRING)
-class T5ForConditionalGeneration(T5PreTrainedModel):
+class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
     _keys_to_ignore_on_load_missing = [
         r"encoder\.embed_tokens\.weight",
         r"decoder\.embed_tokens\.weight",
@@ -1698,7 +1726,11 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             decoder_config.train_task_adapters = adapter_config.task_adapter_in_decoder
         self.decoder = T5Stack(decoder_config, self.shared, adapter_config=adapter_config, prefix_emb=self.prefix_shared)
 
-        self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
+        if adapter_config.task_reduction_factor == 1:
+            # for the debug use
+            self.side_final_upsample = nn.Identity()
+        else:
+            self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
         self.bitfit = adapter_config.bitfit if adapter_config is not None else False 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False if not self.bitfit else True)
 
@@ -2106,6 +2138,41 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         return returns
 
     @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs: ModelOutput = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+
+            if "last_side_hidden_state" in encoder_outputs:
+                encoder_outputs["last_side_hidden_state"] = encoder_outputs.last_side_hidden_state.index_select(
+                    0, expanded_return_idx.to(encoder_outputs.last_side_hidden_state.device)
+                )
+
+            model_kwargs["encoder_outputs"] = encoder_outputs
+        return input_ids, model_kwargs
+
+    @staticmethod
     def _update_model_kwargs_for_generation(
         outputs: ModelOutput, model_kwargs: Dict[str, Any], is_encoder_decoder: bool = False
     ) -> Dict[str, Any]:
@@ -2149,6 +2216,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         reordered_decoder_past = ()
         for layer_past_states in past:
+            if layer_past_states is None:
+                reordered_decoder_past = reordered_decoder_past + (None, )
+                continue
             # get the correct batch idx from layer past batch dim
             # batch dim of `past` is at 2nd position
             reordered_layer_past_states = ()
@@ -2261,13 +2331,3 @@ class T5EncoderModel(T5PreTrainedModel):
         )
 
         return encoder_outputs
-
-
-if __name__ == "__main__":
-    from transformers import AutoTokenizer
-    t = AutoTokenizer("t5-base")
-    m = T5ForConditionalGeneration.from_pretrained("t5-base")
-
-    inputs = t("I like to eat", return_tensors="pt", return_dict=True)
-
-    m(**inputs)

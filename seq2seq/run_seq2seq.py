@@ -742,20 +742,27 @@ def main():
         self_model_state_dict = model.state_dict()
         for n, p in model.named_parameters():
             if "side_block" in n:
-                infer_n = n.split(".")
-                infer_n[1] = "block"
-                infer_n = ".".join(infer_n)
+                if "relative_attention_bias" in n:
+                    # only in the first layer of the pre-trained model
+                    infer_n = n.split(".")
+                    infer_n[1] = "block"
+                    infer_n[2] = "0"
+                    infer_n = ".".join(infer_n)
 
-                print(n, infer_n)
-
-                if "relative_attention_bias" in infer_n:
                     # the size is wrong in pre-trained weights, so load from self model
                     state = self_model_state_dict[infer_n]
+                    p.data.copy_(state)
                 else:
+                    infer_n = n.split(".")
+                    infer_n[1] = "block"
+                    infer_n = ".".join(infer_n)
+
                     state = pruned_state_dict[infer_n]
 
-                p.data.copy_(state)
+                    p.data.copy_(state)
 
+                print(n, infer_n)
+                
             if "final_side_layer_norm" in n:
                 infer_n = n.split("_")
                 infer_n.pop(1)
