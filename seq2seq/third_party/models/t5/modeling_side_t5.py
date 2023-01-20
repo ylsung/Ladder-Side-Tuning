@@ -881,32 +881,13 @@ class T5Stack(T5PreTrainedModel):
 
         self.add_residual_after = config.add_residual_after
         
-        if adapter_config.task_reduction_factor == 1:
-            # for the debug use
-            self.side_first_downsample = nn.Identity()
-        else:
-            self.side_first_downsample = nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling)
+        self.side_first_downsample = nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling)
 
-        if config.side_downsample_pool:
-            self.side_downsamples = nn.ModuleList(
-                [nn.AdaptiveAvgPool1d(side_config.d_model)
-                if i in side_layers else None
-                for i in range(config.num_layers)]
-            )
-        else:
-            if adapter_config.task_reduction_factor == 1:
-                # for the debug use
-                self.side_downsamples = nn.ModuleList(
-                    [nn.Identity()
-                    if i in side_layers else None
-                    for i in range(config.num_layers)]
-                )
-            else:
-                self.side_downsamples = nn.ModuleList(
-                    [nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling) 
-                    if i in side_layers else None
-                    for i in range(config.num_layers)]
-                )
+        self.side_downsamples = nn.ModuleList(
+            [nn.Linear(config.d_model, side_config.d_model, bias=config.add_bias_sampling) 
+            if i in side_layers else None
+            for i in range(config.num_layers)]
+        )
 
         self.use_gate = config.use_gate
         if self.use_gate == "learnable":
@@ -1726,11 +1707,7 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
             decoder_config.train_task_adapters = adapter_config.task_adapter_in_decoder
         self.decoder = T5Stack(decoder_config, self.shared, adapter_config=adapter_config, prefix_emb=self.prefix_shared)
 
-        if adapter_config.task_reduction_factor == 1:
-            # for the debug use
-            self.side_final_upsample = nn.Identity()
-        else:
-            self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
+        self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
         self.bitfit = adapter_config.bitfit if adapter_config is not None else False 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False if not self.bitfit else True)
 

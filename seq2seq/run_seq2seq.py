@@ -679,93 +679,6 @@ def main():
 
                 p.data.copy_(state)
 
-    elif adapter_args.load_side_pretrained_weights == "arbitrary":
-        state_dict = model.state_dict()
-        for n, p in model.named_parameters():
-            if "side_block" in n:
-                infer_n = n.split(".")
-                infer_n[1] = "block"
-                infer_n = ".".join(infer_n)
-
-                print(n, infer_n)
-
-                state = state_dict[infer_n]
-
-                if len(state.shape) == 2:
-                    load_weights = state[:p.shape[0], :p.shape[1]]
-                elif len(state.shape) == 1:
-                    load_weights = state[:p.shape[0]]
-
-                p.data.copy_(load_weights)
-
-            if "final_side_layer_norm" in n:
-                infer_n = n.split("_")
-                infer_n.pop(1)
-                infer_n = "_".join(infer_n)
-
-                print(n, infer_n)
-
-                state = state_dict[infer_n]
-
-                load_weights = state[:p.shape[0]]
-
-                p.data.copy_(load_weights)
-
-            if "side_lm_head" in n:
-                infer_n = n.split(".")
-                infer_n[1] = "lm_head"
-                infer_n = ".".join(infer_n)
-
-                print(n, infer_n)
-
-                state = pruned_state_dict[infer_n]
-
-                p.data.copy_(state)
-
-            if "side_shared" in n:
-                infer_n = n.split(".")
-                infer_n[0] = "shared"
-                infer_n = ".".join(infer_n)
-
-                print(n, infer_n)
-
-                state = pruned_state_dict[infer_n]
-
-                p.data.copy_(state)
-    # elif "t5-base" in adapter_args.load_side_pretrained_weights:
-    #     print(f"Load weights from {adapter_args.load_side_pretrained_weights}")
-    #     state_dict = torch.load(adapter_args.load_side_pretrained_weights)
-    #     self_model_state_dict = model.state_dict()
-    #     for n, p in model.named_parameters():
-    #         if "side_block" in n:
-    #             infer_n = n.split(".")
-    #             infer_n[1] = "block"
-    #             infer_n = ".".join(infer_n)
-
-    #             print(n, infer_n)
-
-    #             if "relative_attention_bias" in infer_n:
-    #                 # the size is wrong in pre-trained weights, so load from self model
-    #                 state = self_model_state_dict[infer_n]
-    #             else:
-    #                 state = state_dict[infer_n]
-
-    #             p.data.copy_(state)
-
-    #         if "final_side_layer_norm" in n:
-    #             infer_n = n.split("_")
-    #             infer_n.pop(1)
-    #             infer_n = "_".join(infer_n)
-
-    #             print(n, infer_n)
-
-    #             if adapter_args.use_updown:
-    #                 # the size is wrong in pre-trained weights, so load from self model
-    #                 state = self_model_state_dict[infer_n]
-    #             else:
-    #                 state = state_dict[infer_n]
-
-    #             p.data.copy_(state)
     elif "fisher" in adapter_args.load_side_pretrained_weights or "t5-base" in adapter_args.load_side_pretrained_weights:
         self_model_state_dict = model.state_dict()
         for n, p in model.named_parameters():
@@ -782,6 +695,7 @@ def main():
                     p.data.copy_(state)
 
                 elif adapter_args.train_side_cross_transformer and "encoder" in n and any([_t in n for _t in ["1.EncDecAttention", "1.layer_norm", "2.layer_norm", "2.DenseReluDense"]]):
+                    # initialize cross-attention
                     infer_n = n.split(".")
                     if "1.EncDecAttention" in n:
                         infer_n[1] = "block"
@@ -808,6 +722,7 @@ def main():
                     p.data.copy_(state.data)
 
                 elif adapter_args.train_side_cross_transformer and "decoder" in n and any([_t in n for _t in ["1.EncDecAttention", "1.layer_norm", "2.EncDecAttention", "2.layer_norm", "3.layer_norm", "3.DenseReluDense"]]):
+                    # initialize cross-attention
                     infer_n = n.split(".")
                     if "1.EncDecAttention" in n:
                         # side cross attn
@@ -898,34 +813,6 @@ def main():
         raise NotImplementedError
 
     model, total_trainable_params_percent = modify_model_after_init(model, training_args, adapter_args)
-
-    if adapter_args.init_side_downsampling:
-        for n, p in model.named_parameters():
-            if "side_downsamples" in n or "side_first_downsample" in n:
-                p.requires_grad = False
-                if "bias" in n:
-                    p.data.zero_()
-                    continue
-
-                identity_matrix = torch.zeros(p.shape)
-                perm = torch.randperm(p.shape[1])
-                idx = perm[:p.shape[0]]
-                idx = torch.sort(idx)[0]
-                identity_matrix[torch.arange(p.shape[0]), idx] = 1
-                p.data.copy_(identity_matrix)
-
-            if "side_final_upsample" in n:
-                p.requires_grad = False
-                if "bias" in n:
-                    p.data.zero_()
-                    continue
-
-                identity_matrix = torch.zeros(p.shape)
-                perm = torch.randperm(p.shape[0])
-                idx = perm[:p.shape[1]]
-                idx = torch.sort(idx)[0]
-                identity_matrix[idx, torch.arange(p.shape[1])] = 1
-                p.data.copy_(identity_matrix)
 
     # Initialize our Trainer
     trainer = Seq2SeqTrainer(
