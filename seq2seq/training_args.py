@@ -88,6 +88,8 @@ class AdapterTrainingArguments:
     low_rank_rank: Optional[int] = field(default=1, metadata={"help": "Defines the rank of low-rank adapters."})
     lambda_distill: float = field(default=0, metadata={"help": "The weight for distill loss."})
     lambda_label: float = field(default=1, metadata={"help": "The weight for label loss."})
+    lambda_kd_ir: float = field(default=1, metadata={"help": "The weight for balancing kd and ir loss (only used in LIT distillation)."})
+    lit_distillation: bool = field(default=False, metadata={"help": "Whether to use LIT distillation."})
     gate_T: float = field(default=0.1, metadata={"help": "The temperature for gates."})
     gate_alpha: float = field(default=0, metadata={"help": "The initial parameter for gating"})
     use_gate: str = field(default="none", metadata={"help": "Whether to use gates"})
@@ -118,3 +120,6 @@ class AdapterTrainingArguments:
 
     lora_dim: int = field(default=16, metadata={"help": "The dimension of the lora linear layers."})
     merge_last: bool = field(default=False, metadata={"help": "If set, merge the information after the last layer of the backbone and side network."})
+
+    train_t5_mlm: bool = field(default=False, metadata={"help": "If set, use t5 mlm data collator and use t5 mlm objective to train the model"})
+    mlm_ratio: float = field(default=0.15, metadata={"help": "The masking ratio for MLM objective"}) 

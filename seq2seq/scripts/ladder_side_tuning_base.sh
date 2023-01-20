@@ -16,6 +16,8 @@ config_name=side_transformers
 r=8
 lr=3e-3
 
+encoder_side_layers="[1,2,3,5,6,7,9,10,11]"
+
 for seed in 0 1 2
 do
     rm -r outputs/${config_name}
@@ -37,8 +39,8 @@ do
     python scripts/update_scripts_for_given_input.py configs/${config_name}.json create_side_lm str2bool False
     python scripts/update_scripts_for_given_input.py configs/${config_name}.json freeze_side_lm str2bool False
     python scripts/update_scripts_for_given_input.py configs/${config_name}.json add_residual_after str2bool False
-    python scripts/update_scripts_for_given_input.py configs/${config_name}.json encoder_side_layers eval None
-    python scripts/update_scripts_for_given_input.py configs/${config_name}.json decoder_side_layers eval None
+    python scripts/update_scripts_for_given_input.py configs/${config_name}.json encoder_side_layers eval ${encoder_side_layers}
+    python scripts/update_scripts_for_given_input.py configs/${config_name}.json decoder_side_layers eval ${encoder_side_layers}
     
     CUDA_VISIBLE_DEVICES=$1 python run_seq2seq.py  configs/${config_name}.json
 

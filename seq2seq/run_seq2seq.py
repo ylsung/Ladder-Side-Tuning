@@ -22,6 +22,7 @@ import torch
 import os
 os.environ['MKL_THREADING_LAYER'] = 'GNU' 
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+os.environ["WANDB_DISABLED"] = "true"
 import sys
 import subprocess
 from typing import Optional, List
@@ -38,7 +39,7 @@ from transformers import (
 from transformers.trainer_utils import is_main_process, get_last_checkpoint
 from seq2seq.utils import get_adapter_config
 from seq2seq.data import AutoTask
-from seq2seq.data import TaskDataCollatorForSeq2Seq
+from seq2seq.data import TaskDataCollatorForSeq2Seq, DataCollatorForT5MLM
 from seq2seq.third_party.trainers import Seq2SeqTrainer
 from training_args import AdapterTrainingArguments
 from seq2seq.utils import modify_model_after_init, save_training_config 
@@ -354,6 +355,7 @@ def main():
     config.prefix_tuning = adapter_args.prefix_tuning
     config.lambda_distill = adapter_args.lambda_distill
     config.lambda_label = adapter_args.lambda_label
+    config.lambda_kd_ir = adapter_args.lambda_kd_ir
     config.gate_T = adapter_args.gate_T
     config.use_gate = adapter_args.use_gate
     config.gate_alpha = adapter_args.gate_alpha
@@ -400,8 +402,9 @@ def main():
     padding = "max_length" if data_args.pad_to_max_length else False
     
     def preprocess_function(examples, max_target_length):
+
         model_inputs = tokenizer(examples['source'], max_length=data_args.max_source_length,
-                                 padding=padding, truncation=True)
+                                padding=padding, truncation=True)
         # Setup the tokenizer for targets
         with tokenizer.as_target_tokenizer():
             labels = tokenizer(examples['target'], max_length=max_target_length, padding=padding, truncation=True)
@@ -414,6 +417,12 @@ def main():
         model_inputs["labels"] = labels["input_ids"]
         model_inputs["extra_fields"] = examples['extra_fields']
         return model_inputs
+
+    def preprocess_function_t5_mlm(examples, *args, **kwargs):
+        # just extract the source, and the data collator will do the rest of work
+        return {"source": examples["source"], "extra_fields": examples['extra_fields']}
+
+    preprocess_function_chosen = preprocess_function_t5_mlm if adapter_args.train_t5_mlm else preprocess_function
 
     column_names = ['source', 'target', 'extra_fields']
     performance_metrics = {}
@@ -432,7 +441,7 @@ def main():
             for dataset_name, dataset_config_name in zip(data_args.dataset_name, data_args.dataset_config_name)]
         for i, train_dataset in enumerate(train_datasets):
             train_datasets[i] = train_datasets[i].map(
-                functools.partial(preprocess_function, max_target_length=max_target_lengths[i]),
+                functools.partial(preprocess_function_chosen, max_target_length=max_target_lengths[i]),
                 batched=True,
                 num_proc=data_args.preprocessing_num_workers,
                 remove_columns=column_names, # if train_dataset != "superglue-record" else column_names+["answers"],
@@ -453,7 +462,7 @@ def main():
             for dataset_name, dataset_config_name in zip(data_args.eval_dataset_name, data_args.eval_dataset_config_name)]
         for k, name in enumerate(eval_datasets):
             eval_datasets[name] = eval_datasets[name].map(
-                    functools.partial(preprocess_function, max_target_length=max_target_lengths[k]),
+                    functools.partial(preprocess_function_chosen, max_target_length=max_target_lengths[k]),
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
                     remove_columns=column_names, # if name != "superglue-record" else column_names+["answers"],
@@ -473,7 +482,7 @@ def main():
             for dataset_name, dataset_config_name in zip(data_args.test_dataset_name, data_args.test_dataset_config_name)]
         for k, name in enumerate(test_datasets):
             test_datasets[name] = test_datasets[name].map(
-                    functools.partial(preprocess_function, max_target_length=max_target_lengths[k]),
+                    functools.partial(preprocess_function_chosen, max_target_length=max_target_lengths[k]),
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
                     remove_columns=column_names,
@@ -482,7 +491,18 @@ def main():
 
     # Data collator
     label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    if data_args.pad_to_max_length:
+    if adapter_args.train_t5_mlm:
+        training_args.remove_unused_columns = False # avoid removing example["source"] when feeding examples to data collator
+        data_collator = DataCollatorForT5MLM(
+            tokenizer=tokenizer,
+            noise_density=adapter_args.mlm_ratio,
+            mean_noise_span_length=3,
+            input_length=data_args.max_source_length,
+            target_length=data_args.max_target_length,
+            pad_token_id=config.pad_token_id,
+            decoder_start_token_id=config.decoder_start_token_id,
+        )
+    elif data_args.pad_to_max_length:
         data_collator = default_data_collator
     else:
         data_collator = TaskDataCollatorForSeq2Seq(
@@ -491,9 +511,15 @@ def main():
             pad_to_multiple_of=8 if training_args.fp16 else None,
         )
 
-    # Metric, we assume we have only one training task.
-    eval_metrics = [AutoTask.get(dataset_name, dataset_config_name).metric\
-        for dataset_name, dataset_config_name in zip(data_args.dataset_name, data_args.dataset_config_name)][0]
+    if adapter_args.train_t5_mlm:
+        from seq2seq.metrics import metrics
+        # just to avoid error happens, whatever metric is used doesn't effect the selected models in distillation
+        eval_metrics = [AutoTask.get(dataset_name, dataset_config_name).metric if dataset_name in ["cola", "stsb"] else [metrics.accuracy] \
+            for dataset_name, dataset_config_name in zip(data_args.dataset_name, data_args.dataset_config_name)][0]
+    else:
+        # Metric, we assume we have only one training task.
+        eval_metrics = [AutoTask.get(dataset_name, dataset_config_name).metric\
+            for dataset_name, dataset_config_name in zip(data_args.dataset_name, data_args.dataset_config_name)][0]
 
     # Extracts the extra information needed to evaluate on each dataset.
     # These information are only used in the compute_metrics.
@@ -581,6 +607,8 @@ def main():
             from seq2seq.third_party.models.t5.modeling_side_logit_t5 import T5ForConditionalGeneration
         else:
             from seq2seq.third_party.models.t5.modeling_side_t5 import T5ForConditionalGeneration
+    elif adapter_args.lit_distillation:
+        from seq2seq.third_party.models.t5.modeling_lit import T5ForConditionalGeneration
     elif adapter_args.train_side_cross_transformer:
         from seq2seq.third_party.models.t5.modeling_cross_side_t5 import T5ForConditionalGeneration
     elif adapter_args.train_deepsidenet_transformer:
@@ -742,20 +770,90 @@ def main():
         self_model_state_dict = model.state_dict()
         for n, p in model.named_parameters():
             if "side_block" in n:
-                infer_n = n.split(".")
-                infer_n[1] = "block"
-                infer_n = ".".join(infer_n)
+                if "relative_attention_bias" in n:
+                    # only in the first layer of the pre-trained model
+                    infer_n = n.split(".")
+                    infer_n[1] = "block"
+                    infer_n[2] = "0"
+                    infer_n = ".".join(infer_n)
 
-                print(n, infer_n)
-
-                if "relative_attention_bias" in infer_n:
                     # the size is wrong in pre-trained weights, so load from self model
                     state = self_model_state_dict[infer_n]
-                else:
+                    p.data.copy_(state)
+
+                elif adapter_args.train_side_cross_transformer and "encoder" in n and any([_t in n for _t in ["1.EncDecAttention", "1.layer_norm", "2.layer_norm", "2.DenseReluDense"]]):
+                    infer_n = n.split(".")
+                    if "1.EncDecAttention" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "0"
+                        infer_n[5] = "SelfAttention"
+
+                    if "1.layer_norm" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "0"
+
+                    if "2.DenseReluDense" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "1"
+
+                    if "2.layer_norm" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "1"
+
+                    infer_n = ".".join(infer_n)
+                    print(n, infer_n)
+
                     state = pruned_state_dict[infer_n]
 
-                p.data.copy_(state)
+                    p.data.copy_(state.data)
 
+                elif adapter_args.train_side_cross_transformer and "decoder" in n and any([_t in n for _t in ["1.EncDecAttention", "1.layer_norm", "2.EncDecAttention", "2.layer_norm", "3.layer_norm", "3.DenseReluDense"]]):
+                    infer_n = n.split(".")
+                    if "1.EncDecAttention" in n:
+                        # side cross attn
+                        infer_n[1] = "block"
+                        infer_n[4] = "0"
+                        infer_n[5] = "SelfAttention"
+
+                    if "1.layer_norm" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "0"
+
+                    if "2.EncDecAttention" in n:
+                        # cross attn
+                        infer_n[1] = "block"
+                        infer_n[4] = "1"
+
+                    if "2.layer_norm" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "1"
+
+                    if "3.DenseReluDense" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "2"
+
+                    if "3.layer_norm" in n:
+                        infer_n[1] = "block"
+                        infer_n[4] = "2"
+
+                    infer_n = ".".join(infer_n)
+                    print(n, infer_n)
+
+                    state = pruned_state_dict[infer_n]
+
+                    p.data.copy_(state.data)
+        
+                else:
+                    infer_n = n.split(".")
+                    infer_n[1] = "block"
+                    infer_n = ".".join(infer_n)
+
+                    state = pruned_state_dict[infer_n]
+
+                    p.data.copy_(state)
+
+                print(n, infer_n)
+                
             if "final_side_layer_norm" in n:
                 infer_n = n.split("_")
                 infer_n.pop(1)
@@ -902,6 +1000,15 @@ def main():
             )
             trainer.log_metrics("eval", metrics)
             trainer.save_metrics("eval", metrics)
+
+        # only useful when computing inference memory
+        if torch.cuda.is_available() and training_args.compute_memory:
+            peak_memory = (torch.cuda.max_memory_allocated() / 1024 ** 2)/1000
+            print(
+                "Memory utilization",
+                peak_memory,
+                "GB"
+            )
 
     # Test
     if training_args.do_test:

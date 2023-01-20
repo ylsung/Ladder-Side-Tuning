@@ -1232,18 +1232,8 @@ class T5Stack(T5PreTrainedModel):
 
                 # skip those modules
                 if side_layer_module is not None:
-                    if not self.add_residual_after:
-                        if self.use_gate == "learnable":
-                            side_gate_param = self.side_gate_params[i]
-                            gate = torch.sigmoid(side_gate_param / self.gate_T)
-                            side_hidden_states = gate * side_hidden_states + (1 - gate) * side_downsample(layer_outputs[0]) # add the information from the backbone network
-                        elif "schedule" in self.use_gate or self.use_gate == "one":
-                            gate = getattr(self, f"side_gate_{i}")
-                            side_hidden_states = gate * side_hidden_states + (1 - gate) * side_downsample(layer_outputs[0])
-                        else:
-                            side_hidden_states = side_hidden_states + side_downsample(layer_outputs[0])
-
-                    # side_hidden_states = side_downsample(side_hidden_states)
+                    if i > 0:
+                        side_hidden_states = side_downsample(hidden_states) # use teacher's representation
 
                     side_layer_outputs = side_layer_module(
                         side_hidden_states,
@@ -1259,17 +1249,8 @@ class T5Stack(T5PreTrainedModel):
                         output_attentions=output_attentions,
                         task=task
                     )
-                    side_hidden_states, side_present_key_value_state = side_layer_outputs[:2]
-                    if self.add_residual_after:
-                        if self.use_gate == "learnable":
-                            side_gate_param = self.side_gate_params[i]
-                            gate = torch.sigmoid(side_gate_param / self.gate_T)
-                            side_hidden_states = gate * side_hidden_states + (1 - gate) * side_downsample(layer_outputs[0]) # add the information from the backbone network
-                        elif "schedule" in self.use_gate or self.use_gate == "one":
-                            gate = getattr(self, f"side_gate_{i}")
-                            side_hidden_states = gate * side_hidden_states + (1 - gate) * side_downsample(layer_outputs[0])
-                        else:
-                            side_hidden_states = side_hidden_states + side_downsample(layer_outputs[0])
+
+                    side_hidden_states, side_present_key_value_state = side_layer_outputs[:2] # extract and save student's representation
 
                     if use_cache is False:
                         side_layer_outputs = side_layer_outputs[:1] + (None,) + side_layer_outputs[1:]
@@ -1707,6 +1688,7 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
         self.prefix_tuning = config.prefix_tuning
         self.lambda_distill = config.lambda_distill
         self.lambda_label = config.lambda_label
+        self.lambda_kd_ir = config.lambda_kd_ir
         if self.prefix_tuning:
            self.prefix_dim = adapter_config.prefix_dim 
            self.init_prefix_from_vocab = adapter_config.init_prefix_from_vocab
@@ -1731,6 +1713,35 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
             self.side_final_upsample = nn.Identity()
         else:
             self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
+
+            self.encoder_upsamples = [
+                nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
+                if layer is not None else None for layer in self.encoder.side_block
+            ]
+
+            # for the first layer
+            self.encoder_upsamples.insert(
+                0,
+                nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling), 
+            )
+
+            self.decoder_upsamples = [
+                nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling)
+                if layer is not None else None for layer in self.decoder.side_block
+            ]
+
+            # for the first layer
+            self.decoder_upsamples.insert(
+                0,
+                nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model, bias=config.add_bias_sampling), 
+            )
+
+            # set the final upsamples to be self.side_final_upsample
+            self.decoder_upsamples[-1] = self.side_final_upsample
+
+            self.encoder_upsamples = nn.ModuleList(self.encoder_upsamples)
+            self.decoder_upsamples = nn.ModuleList(self.decoder_upsamples)
+            
         self.bitfit = adapter_config.bitfit if adapter_config is not None else False 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False if not self.bitfit else True)
 
@@ -1965,6 +1976,8 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        output_hidden_states = True # use for extracting hidden states
+
         # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
         if head_mask is not None and decoder_head_mask is None:
             if self.config.num_layers == self.config.num_decoder_layers:
@@ -2030,7 +2043,6 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
                 decoder_attention_mask = decoder_attention_mask.to(self.decoder.first_device)
 
         # Decode
-
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -2083,12 +2095,47 @@ class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
             loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
             
             if self.lambda_distill != 0:
+                
+                # ir (intermediate representation) loss
+
+                def compute_ir_loss_from_hidden_states(student_hidden_states, teacher_hidden_states, upsamples):
+                    assert len(student_hidden_states) == len(teacher_hidden_states)
+                    assert len(student_hidden_states) == len(upsamples)
+
+                    student_hidden_states = [u(h) for h, u in zip(student_hidden_states, upsamples)]
+
+                    loss = [((s - t.detach()) ** 2).mean()
+                        for s, t in zip(student_hidden_states, teacher_hidden_states)
+                    ]
+
+                    loss = torch.stack(loss, dim=0)
+                    loss = torch.mean(loss)
+
+                    return loss
+
+                enc_ir_loss = compute_ir_loss_from_hidden_states(
+                    encoder_outputs.side_hidden_states, 
+                    encoder_outputs.hidden_states,
+                    self.encoder_upsamples,
+                )
+
+                dec_ir_loss = compute_ir_loss_from_hidden_states(
+                    decoder_outputs.side_hidden_states, 
+                    decoder_outputs.hidden_states,
+                    self.decoder_upsamples,
+                )
+
+                ir_loss = (enc_ir_loss + dec_ir_loss) / 2
+
+                # kd loss
+
                 teacher_logits = self.lm_head(backbone_sequence_ouptut)
 
                 lm_dist = F.log_softmax(lm_logits, -1)
                 teacher_dist = F.log_softmax(teacher_logits / 0.1, -1) # normalize by temperature 0.1
-
-                distill_loss = F.kl_div(lm_dist, teacher_dist.detach(), reduction="batchmean", log_target=True)
+                
+                kd_loss = F.kl_div(lm_dist, teacher_dist.detach(), reduction="batchmean", log_target=True)
+                distill_loss = self.lambda_kd_ir * kd_loss + (1 - self.lambda_kd_ir) * ir_loss
                 # distill_loss = ((decoder_outputs.last_hidden_state.detach() - decoder_outputs.last_side_hidden_state) ** 2).mean()
                 loss = self.lambda_label * loss + self.lambda_distill * distill_loss
             # TODO(thom): Add z_loss https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/layers.py#L666

@@ -48,7 +48,9 @@ from .modeling_side_outputs import SideBaseModelOutputWithPastAndCrossAttentions
 from seq2seq.adapters import AdapterController
 from seq2seq.hypercomplex.layers import  PHMLinear
 from seq2seq.hypercomplex.inits import  glorot_uniform, glorot_normal
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
+
+from seq2seq.third_party.generation_utils import GenerationMixin as SideGenerationMixin
 
 
 logger = logging.get_logger(__name__)
@@ -471,6 +473,7 @@ class T5Attention(nn.Module):
                 else:
                     # cross-attn
                     hidden_states = past_key_value
+
             return hidden_states
 
         # get query states
@@ -506,7 +509,218 @@ class T5Attention(nn.Module):
 
             if mask is not None:
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
+        scores += position_bias
+        attn_weights = F.softmax(scores.float(), dim=-1).type_as(
+            scores
+        )  # (batch_size, n_heads, seq_length, key_length)
+        attn_weights = F.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )  # (batch_size, n_heads, seq_length, key_length)
 
+        # Mask heads if we want to
+        if layer_head_mask is not None:
+            attn_weights = attn_weights * layer_head_mask
+
+        attn_output = unshape(torch.matmul(attn_weights, value_states))  # (batch_size, seq_length, dim)
+        attn_output = self.o(attn_output)
+
+        present_key_value_state = (key_states, value_states) if (self.is_decoder and use_cache) else None
+        outputs = (attn_output,) + (present_key_value_state,) + (position_bias,)
+
+        if output_attentions:
+            outputs = outputs + (attn_weights,)
+        return outputs
+
+
+class T5SideCrossAttention(nn.Module):
+    def __init__(self, config: T5Config, has_relative_attention_bias=False, adapter_config=None):
+        super().__init__()
+        self.bitfit = adapter_config.bitfit if adapter_config is not None else False 
+        self.is_decoder = config.is_decoder
+        self.has_relative_attention_bias = has_relative_attention_bias
+
+        self.relative_attention_num_buckets = config.relative_attention_num_buckets
+        self.d_model = config.d_model
+        self.key_value_proj_dim = config.d_kv
+        self.n_heads = config.num_heads
+        self.dropout = config.dropout_rate
+        self.inner_dim = self.n_heads * self.key_value_proj_dim
+
+        # Mesh TensorFlow initialization to avoid scaling before softmax
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False if not self.bitfit else True)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False if not self.bitfit else True)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False if not self.bitfit else True)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False if not self.bitfit else True)
+
+        if self.has_relative_attention_bias:
+            self.relative_attention_bias = nn.Embedding(self.relative_attention_num_buckets, self.n_heads)
+        self.pruned_heads = set()
+        self.gradient_checkpointing = getattr(config, "gradient_checkpointing", False)
+
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.n_heads, self.key_value_proj_dim, self.pruned_heads
+        )
+        # Prune linear layers
+        self.q = prune_linear_layer(self.q, index)
+        self.k = prune_linear_layer(self.k, index)
+        self.v = prune_linear_layer(self.v, index)
+        self.o = prune_linear_layer(self.o, index, dim=1)
+        # Update hyper params
+        self.n_heads = self.n_heads - len(heads)
+        self.inner_dim = self.key_value_proj_dim * self.n_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, bidirectional=True, num_buckets=32, max_distance=128):
+        """
+        Adapted from Mesh Tensorflow:
+        https://github.com/tensorflow/mesh/blob/0cb87fe07da627bf0b7e60475d59f95ed6b5be3d/mesh_tensorflow/transformer/transformer_layers.py#L593
+        Translate relative position to a bucket number for relative attention. The relative position is defined as
+        memory_position - query_position, i.e. the distance in tokens from the attending position to the attended-to
+        position. If bidirectional=False, then positive relative positions are invalid. We use smaller buckets for
+        small absolute relative_position and larger buckets for larger absolute relative_positions. All relative
+        positions >=max_distance map to the same bucket. All relative positions <=-max_distance map to the same bucket.
+        This should allow for more graceful generalization to longer sequences than the model has been trained on
+        Args:
+            relative_position: an int32 Tensor
+            bidirectional: a boolean - whether the attention is bidirectional
+            num_buckets: an integer
+            max_distance: an integer
+        Returns:
+            a Tensor with the same shape as relative_position, containing int32 values in the range [0, num_buckets)
+        """
+        relative_buckets = 0
+        if bidirectional:
+            num_buckets //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+        # now relative_position is in the range [0, inf)
+
+        # half of the buckets are for exact increments in positions
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        # The other half of the buckets are for logarithmically bigger bins in positions up to max_distance
+        relative_postion_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        relative_postion_if_large = torch.min(
+            relative_postion_if_large, torch.full_like(relative_postion_if_large, num_buckets - 1)
+        )
+
+        relative_buckets += torch.where(is_small, relative_position, relative_postion_if_large)
+        return relative_buckets
+
+    def compute_bias(self, query_length, key_length):
+        """Compute binned relative position bias"""
+        context_position = torch.arange(query_length, dtype=torch.long)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long)[None, :]
+        relative_position = memory_position - context_position  # shape (query_length, key_length)
+        relative_position_bucket = self._relative_position_bucket(
+            relative_position,  # shape (query_length, key_length)
+            bidirectional=(not self.is_decoder),
+            num_buckets=self.relative_attention_num_buckets,
+        )
+        relative_position_bucket = relative_position_bucket.to(self.relative_attention_bias.weight.device)
+        values = self.relative_attention_bias(relative_position_bucket)  # shape (query_length, key_length, num_heads)
+        values = values.permute([2, 0, 1]).unsqueeze(0)  # shape (1, num_heads, query_length, key_length)
+        return values
+
+    def forward(
+        self,
+        hidden_states,
+        mask=None,
+        key_value_states=None,
+        position_bias=None,
+        past_key_value=None,
+        layer_head_mask=None,
+        query_length=None,
+        use_cache=False,
+        output_attentions=False,
+    ):
+        """
+        Self-attention (if key_value_states is None) or attention over source sentence (provided by key_value_states).
+        """
+        # Input is (batch_size, seq_length, dim)
+        # Mask is (batch_size, key_length) (non-causal) or (batch_size, key_length, key_length)
+        # past_key_value[0] is (batch_size, n_heads, q_len - 1, dim_per_head)
+        batch_size, seq_length = hidden_states.shape[:2]
+        int_seq_length = int(seq_length)
+
+        real_seq_length = seq_length 
+
+        if past_key_value is not None:
+            assert (
+                len(past_key_value) == 2
+            ), f"past_key_value should have 2 past states: keys and values. Got { len(past_key_value)} past states"
+            real_seq_length += past_key_value[0].shape[2] if query_length is None else query_length
+
+        key_length = real_seq_length if key_value_states is None else key_value_states.shape[1]
+
+        def shape(states):
+            """projection"""
+            return states.view(batch_size, -1, self.n_heads, self.key_value_proj_dim).transpose(1, 2)
+
+        def unshape(states):
+            """reshape"""
+            return states.transpose(1, 2).contiguous().view(batch_size, -1, self.inner_dim)
+
+        def project(hidden_states, proj_layer, key_value_states, past_key_value):
+            """projects hidden states correctly to key/query states"""
+            ## Modify here for the side cross attn
+            # The hidden_states are the dynamic backbone hidden states
+            if past_key_value is None:
+                # cross-attn
+                # (batch_size, n_heads, seq_length, dim_per_head)
+                hidden_states = shape(proj_layer(key_value_states))
+
+            if past_key_value is not None:
+                # cross-attn
+                hidden_states = shape(proj_layer(key_value_states))
+                hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
+
+            return hidden_states
+
+        # get query states
+        query_states = shape(self.q(hidden_states))  # (batch_size, n_heads, seq_length, dim_per_head)
+
+        # get key/value states
+        key_states = project(
+            hidden_states, self.k, key_value_states, past_key_value[0] if past_key_value is not None else None
+        )
+        value_states = project(
+            hidden_states, self.v, key_value_states, past_key_value[1] if past_key_value is not None else None
+        )
+
+        # compute scores
+        scores = torch.matmul(
+            query_states, key_states.transpose(3, 2)
+        )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
+
+        if position_bias is None:
+            if not self.has_relative_attention_bias:
+                position_bias = torch.zeros(
+                    (1, self.n_heads, real_seq_length, key_length), device=scores.device, dtype=scores.dtype
+                )
+                if self.training and self.gradient_checkpointing:
+                    position_bias.requires_grad = True
+            else:
+                position_bias = self.compute_bias(real_seq_length, key_length)
+
+            # if key and values are already calculated
+            # we want only the last query position bias
+            if past_key_value is not None:
+                position_bias = position_bias[:, :, -int_seq_length:, :]
+
+            if mask is not None:
+                position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
         scores += position_bias
         attn_weights = F.softmax(scores.float(), dim=-1).type_as(
             scores
@@ -573,9 +787,12 @@ class T5LayerSelfAttention(nn.Module):
 
 
 class T5LayerCrossAttention(nn.Module):
-    def __init__(self, config, adapter_config=None):
+    def __init__(self, config, adapter_config=None, side_cross_attn=False):
         super().__init__()
-        self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False, adapter_config=adapter_config)
+        if side_cross_attn:
+            self.EncDecAttention = T5SideCrossAttention(config, has_relative_attention_bias=False, adapter_config=adapter_config)
+        else:
+            self.EncDecAttention = T5Attention(config, has_relative_attention_bias=False, adapter_config=adapter_config)
         self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon, adapter_config=adapter_config)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -733,9 +950,13 @@ class T5SideBlock(nn.Module):
         self.layer = nn.ModuleList()
         self.layer.append(T5LayerSelfAttention(config,has_relative_attention_bias=has_relative_attention_bias, adapter_config=adapter_config))
         if self.is_decoder:
+            # decoder side cross attention
+            self.layer.append(T5LayerCrossAttention(config, adapter_config=adapter_config, side_cross_attn=True))
+            # cross attention
             self.layer.append(T5LayerCrossAttention(config, adapter_config=adapter_config))
-
-        self.layer.append(T5LayerCrossAttention(config, adapter_config=adapter_config))
+        else:
+            # encoder side cross attention
+            self.layer.append(T5LayerCrossAttention(config, adapter_config=adapter_config))
         self.layer.append(T5LayerFF(config, adapter_config=adapter_config))
 
     def forward(
@@ -757,7 +978,7 @@ class T5SideBlock(nn.Module):
         task=None
     ):
         if past_key_value is not None:
-            assert self.is_decoder, "Only decoder can use `past_key_values`"
+            # assert self.is_decoder, "Only decoder can use `past_key_values`"
             # expected_num_past_key_values = 4 if encoder_hidden_states is None else 6
 
             # if len(past_key_value) != expected_num_past_key_values:
@@ -766,10 +987,22 @@ class T5SideBlock(nn.Module):
             #         f"{'2 (past / key) for cross attention' if expected_num_past_key_values == 4 else ''}."
             #         f"Got {len(past_key_value)} past key / value states"
             #     )
+            if self.is_decoder:
+                self_attn_past_key_value = past_key_value[:2]
+                side_cross_attn_past_key_value = past_key_value[2:4]
+                cross_attn_past_key_value = past_key_value[4:]
 
-            self_attn_past_key_value = past_key_value[:2]
-            cross_attn_past_key_value = past_key_value[2:4]
-            side_cross_attn_past_key_value = past_key_value[4:]
+                # print("is decoder")
+                # print(self_attn_past_key_value[0].shape, self_attn_past_key_value[1].shape)
+                # print(cross_attn_past_key_value[0].shape, cross_attn_past_key_value[1].shape)
+                # print(side_cross_attn_past_key_value[0].shape, side_cross_attn_past_key_value[1].shape)
+            else:
+                self_attn_past_key_value = past_key_value[:2]
+                side_cross_attn_past_key_value = past_key_value[2:]
+
+                # print("is encoder")
+                # print(self_attn_past_key_value[0].shape, self_attn_past_key_value[1].shape)
+                # print(side_cross_attn_past_key_value[0].shape, side_cross_attn_past_key_value[1].shape)
 
             # print("self", self_attn_past_key_value[0].shape, self_attn_past_key_value[1].shape)
             # print("side", side_cross_attn_past_key_value[0].shape, side_cross_attn_past_key_value[1].shape)
@@ -796,6 +1029,34 @@ class T5SideBlock(nn.Module):
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
 
+        # for encoder: [attn, side, hidden]
+        # for decoder: [attn, side, cross, hidden]
+
+        if present_key_value_state is not None:
+            query_length = present_key_value_state[0].shape[2]
+        else:
+            query_length = None
+
+        side_cross_attention_outputs = self.layer[1](
+            hidden_states,
+            key_value_states=backbone_hidden_states,
+            attention_mask=attention_mask,
+            position_bias=position_bias,
+            layer_head_mask=layer_head_mask,
+            past_key_value=side_cross_attn_past_key_value,
+            query_length=query_length,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+        )
+
+        hidden_states = side_cross_attention_outputs[0]
+
+        # Combine self attn and cross attn key value states
+        if present_key_value_state is not None:
+            # side_cross_attention_key_value = torch.cat([side_cross_attention_outputs[1], backbone_hidden_states], dim=2)
+            side_cross_attention_key_value = side_cross_attention_outputs[1]
+            present_key_value_state = present_key_value_state + side_cross_attention_key_value
+
         do_cross_attention = self.is_decoder and encoder_hidden_states is not None
         if do_cross_attention:
             # the actual query length is unknown for cross attention
@@ -805,7 +1066,7 @@ class T5SideBlock(nn.Module):
             else:
                 query_length = None
 
-            cross_attention_outputs = self.layer[1](
+            cross_attention_outputs = self.layer[2](
                 hidden_states,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
@@ -836,24 +1097,6 @@ class T5SideBlock(nn.Module):
             query_length = None
 
         # print("backbone", backbone_hidden_states.shape)
-
-        side_cross_attention_outputs = self.layer[-2](
-            hidden_states,
-            key_value_states=backbone_hidden_states,
-            attention_mask=attention_mask,
-            position_bias=position_bias,
-            layer_head_mask=layer_head_mask,
-            past_key_value=side_cross_attn_past_key_value,
-            query_length=query_length,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
-
-        hidden_states = side_cross_attention_outputs[0]
-
-        # Combine self attn and cross attn key value states
-        if present_key_value_state is not None:
-            present_key_value_state = present_key_value_state + side_cross_attention_outputs[1]
 
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states,
@@ -1010,15 +1253,16 @@ class T5Stack(T5PreTrainedModel):
         side_config.d_kv = side_config.d_kv // self.adapter_config.task_reduction_factor
         side_config.d_model = side_config.d_model // self.adapter_config.task_reduction_factor
 
-        SIDE_BLOCK = T5Block if self.is_decoder else T5SideBlock
+        # SIDE_BLOCK = T5Block if self.is_decoder else T5SideBlock
+
+        SIDE_BLOCK = T5SideBlock
         self.side_block = nn.ModuleList(
             [SIDE_BLOCK(self.per_layer_config(side_config, i, self.adapter_config, self.is_decoder),
                      has_relative_attention_bias=bool(i == 0),
                      adapter_config=adapter_config) for i in range(config.num_layers)]
         )
-        self.side_upsamples = nn.ModuleList(
-            [nn.Linear(side_config.d_model, config.d_model) for i in range(config.num_layers)]
-        )
+
+        self.side_first_downsample = nn.Linear(config.d_model, side_config.d_model)
 
         self.side_downsamples = nn.ModuleList(
             [nn.Linear(config.d_model, side_config.d_model) for i in range(config.num_layers)]
@@ -1029,12 +1273,12 @@ class T5Stack(T5PreTrainedModel):
         )
 
         self.cross_side_downsamples = None
-        if self.is_decoder:
-            self.cross_side_downsamples = nn.Linear(config.d_model, side_config.d_model)
+        # if self.is_decoder:
+        #     self.cross_side_downsamples = nn.Linear(config.d_model, side_config.d_model)
         
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
-        self.final_side_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.final_side_layer_norm = T5LayerNorm(side_config.d_model, eps=config.layer_norm_epsilon)
 
         self.init_weights()
         # Model parallel
@@ -1083,11 +1327,6 @@ class T5Stack(T5PreTrainedModel):
             for layer in v:
                 cuda_device = "cuda:" + str(k)
                 self.side_block[layer] = self.side_block[layer].to(cuda_device)
-
-        for k, v in self.device_map.items():
-            for layer in v:
-                cuda_device = "cuda:" + str(k)
-                self.side_upsamples[layer] = self.side_upsamples[layer].to(cuda_device)
 
         for k, v in self.device_map.items():
             for layer in v:
@@ -1220,15 +1459,19 @@ class T5Stack(T5PreTrainedModel):
 
         position_bias = None
         encoder_decoder_position_bias = None
+
+        side_position_bias = None
+        side_encoder_decoder_position_bias = None
+
         backbone_hidden_state = None
         side_past_key_value = None
 
         hidden_states = self.dropout(inputs_embeds)
 
-        side_hidden_states = hidden_states
+        side_hidden_states = self.side_first_downsample(self.dropout(inputs_embeds))
 
-        if self.cross_side_downsamples is not None and side_encoder_hidden_states is not None:
-            side_encoder_hidden_states = self.cross_side_downsamples(side_encoder_hidden_states)
+        # if self.cross_side_downsamples is not None and side_encoder_hidden_states is not None:
+        #     side_encoder_hidden_states = self.cross_side_downsamples(side_encoder_hidden_states)
 
         for i, (layer_module, past_key_value) in enumerate(zip(self.block, past_key_values)):
             layer_head_mask = head_mask[i]
@@ -1236,7 +1479,6 @@ class T5Stack(T5PreTrainedModel):
             side_layer_module = self.side_block[i]
             side_past_key_value = side_past_key_values[i]
             side_downsample = self.side_downsamples[i]
-            side_upsample = self.side_upsamples[i]
             side_gate_param = self.side_gate_params[i]
 
             # Model parallel
@@ -1315,60 +1557,32 @@ class T5Stack(T5PreTrainedModel):
 
             hidden_states, present_key_value_state = layer_outputs[:2]
 
-            if self.is_decoder is False:
-                side_hidden_states = side_downsample(side_hidden_states)
-
-                # if present_key_value_states is not None and len(present_key_value_states) > 0:
-                #     backbone_hidden_states = present_key_value_state[1].transpose(1, 2)
-                #     backbone_hidden_states = backbone_hidden_states.reshape(
-                #         backbone_hidden_states.shape[0], backbone_hidden_states.shape[1], -1
-                #     )
-                # else:
-                backbone_hidden_states = hidden_states
-
-                backbone_hidden_states = side_downsample(backbone_hidden_states)
-                
-                side_layer_outputs = side_layer_module(
-                    side_hidden_states,
-                    backbone_hidden_states,
-                    attention_mask=extended_attention_mask,
-                    position_bias=position_bias,
-                    encoder_hidden_states=side_encoder_hidden_states,
-                    encoder_attention_mask=encoder_extended_attention_mask,
-                    encoder_decoder_position_bias=encoder_decoder_position_bias,
-                    layer_head_mask=layer_head_mask,
-                    cross_attn_layer_head_mask=cross_attn_layer_head_mask,
-                    past_key_value=side_past_key_value,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    task=task
-                )
-            else:
-                gate = torch.sigmoid(side_gate_param * 10)
-                side_hidden_states = gate * side_hidden_states + (1 - gate) * hidden_states # add the information from the backbone network
-                side_hidden_states = side_downsample(side_hidden_states)
-                
-                side_layer_outputs = side_layer_module(
-                    side_hidden_states,
-                    attention_mask=extended_attention_mask,
-                    position_bias=position_bias,
-                    encoder_hidden_states=side_encoder_hidden_states,
-                    encoder_attention_mask=encoder_extended_attention_mask,
-                    encoder_decoder_position_bias=encoder_decoder_position_bias,
-                    layer_head_mask=layer_head_mask,
-                    cross_attn_layer_head_mask=cross_attn_layer_head_mask,
-                    past_key_value=side_past_key_value,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    task=task
-                )
+            backbone_hidden_states = side_downsample(hidden_states)
+            
+            side_layer_outputs = side_layer_module(
+                side_hidden_states,
+                backbone_hidden_states,
+                attention_mask=extended_attention_mask,
+                position_bias=side_position_bias,
+                encoder_hidden_states=side_encoder_hidden_states,
+                encoder_attention_mask=encoder_extended_attention_mask,
+                encoder_decoder_position_bias=side_encoder_decoder_position_bias,
+                layer_head_mask=layer_head_mask,
+                cross_attn_layer_head_mask=cross_attn_layer_head_mask,
+                past_key_value=side_past_key_value,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                task=task
+            )
 
             if use_cache is False:
                 side_layer_outputs = side_layer_outputs[:1] + (None,) + side_layer_outputs[1:]
 
             side_hidden_states, side_present_key_value_state = side_layer_outputs[:2]
 
-            side_hidden_states = side_upsample(side_hidden_states)
+            side_position_bias = side_layer_outputs[2]
+            if self.is_decoder and side_encoder_hidden_states is not None:
+                side_encoder_decoder_position_bias = side_layer_outputs[4 if output_attentions else 3]
 
             # gate = torch.sigmoid(side_gate_param * 10)
             # side_hidden_states = gate * side_hidden_states + (1 - gate) * hidden_states # add the information from the backbone network
@@ -1767,7 +1981,7 @@ class T5Model(T5PreTrainedModel):
 
 
 @add_start_docstrings("""T5 Model with a `language modeling` head on top. """, T5_START_DOCSTRING)
-class T5ForConditionalGeneration(T5PreTrainedModel):
+class T5ForConditionalGeneration(SideGenerationMixin, T5PreTrainedModel):
     _keys_to_ignore_on_load_missing = [
         r"encoder\.embed_tokens\.weight",
         r"decoder\.embed_tokens\.weight",
@@ -1777,7 +1991,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         r"decoder\.block\.0\.layer\.1\.EncDecAttention\.relative_attention_bias\.weight",
     ]
 
-    def __init__(self, config, adapter_config=None):
+    def __init__(self, config, adapter_config=None, lora_config=None):
         super().__init__(config)
         self.model_dim = config.d_model
         # TODO: we need to init the shared prefix embedding.
@@ -1802,6 +2016,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         if config.train_task_adapters:
             decoder_config.train_task_adapters = adapter_config.task_adapter_in_decoder
         self.decoder = T5Stack(decoder_config, self.shared, adapter_config=adapter_config, prefix_emb=self.prefix_shared)
+
+        self.side_final_upsample = nn.Linear(config.d_model // adapter_config.task_reduction_factor, config.d_model)
 
         self.bitfit = adapter_config.bitfit if adapter_config is not None else False 
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False if not self.bitfit else True)
@@ -2116,6 +2332,7 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         )
 
         sequence_output = decoder_outputs.last_side_hidden_state
+        sequence_output = self.side_final_upsample(sequence_output)
 
         # Set device for model parallelism
         if self.model_parallel:
@@ -2178,6 +2395,8 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
         if past is not None:
             input_ids = input_ids[:, -1:]
 
+            # print("IN function:", past[0].shape, past[1].shape)
+
         returns = {
             "decoder_input_ids": input_ids,
             "past_key_values": past,
@@ -2192,6 +2411,41 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
             returns["side_past_key_values"] = kwargs["side_past_key_values"]
 
         return returns
+
+    @staticmethod
+    def _expand_inputs_for_generation(
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        attention_mask: torch.LongTensor = None,
+        encoder_outputs: ModelOutput = None,
+        **model_kwargs,
+    ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
+        expanded_return_idx = (
+            torch.arange(input_ids.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(input_ids.device)
+        )
+        input_ids = input_ids.index_select(0, expanded_return_idx)
+
+        if "token_type_ids" in model_kwargs:
+            token_type_ids = model_kwargs["token_type_ids"]
+            model_kwargs["token_type_ids"] = token_type_ids.index_select(0, expanded_return_idx)
+
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask.index_select(0, expanded_return_idx)
+
+        if is_encoder_decoder:
+            assert encoder_outputs is not None
+            encoder_outputs["last_hidden_state"] = encoder_outputs.last_hidden_state.index_select(
+                0, expanded_return_idx.to(encoder_outputs.last_hidden_state.device)
+            )
+
+            if "last_side_hidden_state" in encoder_outputs:
+                encoder_outputs["last_side_hidden_state"] = encoder_outputs.last_side_hidden_state.index_select(
+                    0, expanded_return_idx.to(encoder_outputs.last_side_hidden_state.device)
+                )
+
+            model_kwargs["encoder_outputs"] = encoder_outputs
+        return input_ids, model_kwargs
 
     @staticmethod
     def _update_model_kwargs_for_generation(
@@ -2237,6 +2491,9 @@ class T5ForConditionalGeneration(T5PreTrainedModel):
 
         reordered_decoder_past = ()
         for layer_past_states in past:
+            if layer_past_states is None:
+                reordered_decoder_past = reordered_decoder_past + (None, )
+                continue
             # get the correct batch idx from layer past batch dim
             # batch dim of `past` is at 2nd position
             reordered_layer_past_states = ()
