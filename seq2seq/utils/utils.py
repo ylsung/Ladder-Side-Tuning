@@ -58,7 +58,7 @@ def create_dir(output_dir):
 
 
 def get_adapter_config(adapter_args, data_args, training_args, config):
-    if adapter_args.train_task_adapters or adapter_args.prefix_tuning or adapter_args.bitfit or adapter_args.train_side_ladder or adapter_args.train_side_transformer or adapter_args.train_side_cross_transformer or adapter_args.train_deepsidenet_transformer:
+    if adapter_args.train_task_adapters or adapter_args.prefix_tuning or adapter_args.bitfit or adapter_args.train_side_ladder or adapter_args.train_side_transformer or adapter_args.train_side_cross_transformer or adapter_args.train_deepsidenet_transformer or adapter_args.lit_distillation:
         adapter_config = AutoAdapterConfig.get(adapter_args.adapter_config_name)
         adapter_config.input_dim = config.d_model
 
@@ -94,7 +94,7 @@ def freeze_model_params(model, adapter_args):
     """
     # If we are training adapters, we freeze all parameters except the
     # adapter parameters like adapter controllers.
-    if adapter_args.train_task_adapters or adapter_args.train_side_ladder or adapter_args.train_side_transformer or adapter_args.train_side_cross_transformer or adapter_args.train_deepsidenet_transformer:
+    if adapter_args.train_task_adapters or adapter_args.train_side_ladder or adapter_args.train_side_transformer or adapter_args.train_side_cross_transformer or adapter_args.train_deepsidenet_transformer or adapter_args.lit_distillation:
         freeze_params(model)
         for name, sub_module in model.named_modules():
             if isinstance(sub_module, (AdapterController, Adapter)):
@@ -113,7 +113,7 @@ def freeze_model_params(model, adapter_args):
                 if "side" in n:
                     p.requires_grad = True
 
-        if adapter_args.train_side_transformer or adapter_args.train_deepsidenet_transformer:
+        if adapter_args.train_side_transformer or adapter_args.train_deepsidenet_transformer or adapter_args.lit_distillation:
             for n, p in model.named_parameters():
                 if "side" in n:
                     p.requires_grad = True
